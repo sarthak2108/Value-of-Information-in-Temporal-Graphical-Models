@@ -1,13 +1,28 @@
+#########################################################################################
+# CODE FOR OPTIMIZING VALUE OF INFORMATION (VOI) IN TEMPORAL GRAPHICAL MODELS IN
+# THE CONDITIONAL PLANNING SETTING OVER AN INFINITE TIME HORIZON.
+# ALSO INCLUDES IMPLEMENTATIONS OF BASELINE TECHNIQUES, SUCH AS VoIDP
+# (KRAUSE AND GUESTRIN, [2005]), AND THE UNIFORM SPACING HEURISTIC.
+#########################################################################################
+
+#########################################################################################
+# EXTERNAL.
+#########################################################################################
 from copy import deepcopy
 from itertools import permutations
 from math import log
 from math import inf
 from math import pow
+from math import ceil
+import numpy
+import pycuda.autoinit
+import pycuda.driver as drv
+import pycuda.gpuarray as gpuarray
+from pycuda.compiler import SourceModule
 
 #########################################################################################
 # MDP NODES USED BY OUR ALGORITHM.
 #########################################################################################
-
 class MDP:
 	def __init__(self, domain, X, O, gamma, reward, o, k, m, B):
 		self.X = X
@@ -26,9 +41,8 @@ class MDP:
 		self.choice = -1
 
 #########################################################################################
-# MDP NODES USED BY VOIDP (KRAUSE AND GUESTRIN, 2005)
-#########################################################################################
-		
+# MDP NODES USED BY VoIDP (KRAUSE AND GUESTRIN, 2005)
+#########################################################################################	
 class finite_MDP:
 	def __init__(self, domain):
 		self.select_state = [None for i in range(domain)]
@@ -40,11 +54,48 @@ class finite_MDP:
 
 #########################################################################################
 # GLOBAL DICTIONARIES.
-#########################################################################################
-		
+#########################################################################################	
 prob = dict()
 local_reward = dict()
 mdp_states = dict()
+
+#########################################################################################
+# CUDA SOURCE MODULE.
+#########################################################################################
+mod = SourceModule("""
+__global__ void update(float *old_value, float *new_value, float *local, int *select, float *prob, int *skip, float *pars)
+{
+	const int i = threadIdx.x + blockDim.x * blockIdx.x;
+	if(i < int(pars[2])){
+		if((select[i * int(pars[0])] != -1) && (skip[i] != -1)){
+			float sel = 0;
+			float sk = 0;
+			for(int j = 0; j < int(pars[0]); j++){
+				sel += prob[i * int(pars[0]) + j] * old_value[select[i * int(pars[0]) + j]];
+			}
+			sk = old_value[skip[i]];
+			if(sel > sk){
+				new_value[i] = local[i] + pars[1] * sel;
+			}
+			else{
+				new_value[i] = local[i] + pars[1] * sk;
+			}
+		}
+		else if(select[i * int(pars[0])] == -1){
+			new_value[i] = local[i] + pars[1] * old_value[skip[i]];
+		}
+		else{
+			new_value[i] = local[i];
+			for(int j = 0; j < int(pars[0]); j++){
+				new_value[i] += pars[1] * prob[i * int(pars[0]) + j] * old_value[select[i * int(pars[0]) + j]];
+			}
+		}
+	}
+	else{
+		new_value[i] = old_value[i];
+	}
+}
+""")
 
 #########################################################################################
 # UNCOMMENT THE FOLLOWING TWO MODELS AS NECESSARY, BUT NOT SIMULTAENEOUSLY.
@@ -53,12 +104,12 @@ mdp_states = dict()
 # CHAIN MODEL FOR THE TEMPERATURE TASK (BASED ON DATA AVAILABLE AT
 # http://db.csail.mit.edu/labdata/labdata.html).
 #########################################################################################
-'''prior = [0.00031575623618566466,0.016103568045468898,0.3514366908746448,0.5775181559835807,0.05462582886011999]
+prior = [0.00031575623618566466,0.016103568045468898,0.3514366908746448,0.5775181559835807,0.05462582886011999]
 transition = [[0.2,0.2,0.2,0.2,0.2],
 [0.01818181818181818,0.7090909090909091,0.12727272727272726,0.12727272727272726,0.01818181818181818],
 [0.0008968609865470852,0.011659192825112108,0.8726457399103139,0.10852017937219731,0.006278026905829596],
 [0.0005461496450027307,0.0005461496450027307,0.0726379027853632,0.9016930638995084,0.024576734025122882],
-[0.005714285714285714,0.005714285714285714,0.005714285714285714,0.28,0.7028571428571428]]'''
+[0.005714285714285714,0.005714285714285714,0.005714285714285714,0.28,0.7028571428571428]]
 #########################################################################################
 # HMM FOR THE PSYCHIATRY TASK (PARAMETERS TAKEN FROM HUANG, 2016).
 #########################################################################################
@@ -87,18 +138,31 @@ def next(X):
 		return (1, X[1])
 	else:
 		return (0, X[1] + 1)'''
-		
+
+#########################################################################################
+# GENERATING THE MDP CORRESPONDING TO OUR ALGORITHM.
+#########################################################################################		
 def plan_MDP(domain, k, m, B, max_B, gamma):
+	#########################################################################################
+	# WE EMPLOY THE DICTIONARY reg_ID TO KEEP TRACK OF AN ORDERING OF MDP STATES.
+	#########################################################################################
 	MDP_states = dict()
-	pen = 0.54
-	s = MDP(domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, 0, k - 1, m, B)
+	reg_ID = dict()
+	pen = 0.0
+	s, id = MDP(domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, 0, k - 1, m, B), 0
 	WL = [s]
 	while len(WL) != 0:
 		s = WL.pop(0)
 		if (s.X, s.O, s.o, s.k, s.m, s.B) not in MDP_states:
 			if s.X[0] == 0 or s.X[0] == -1:
+				#########################################################################################
+				# NON-SEPARATOR VARIABLE.
+				#########################################################################################
 				new_X = next(s.X)
 				if new_X[0] == 0:
+					#########################################################################################
+					# THE NEXT VARIABLE IS ALSO A NON-SEPARATOR VARIABLE, AND HENCE OBSERVED BY DEFAULT.
+					#########################################################################################
 					for i in range(domain):
 						new_O = list(s.O)
 						if new_O == [((-1, -1), -1)]:
@@ -111,12 +175,21 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 						s.select_prob[i] = prob[(new_X, i), s.O]
 						s.choice = 1
 				else:
+					#########################################################################################
+					# THE NEXT VARIABLE IS A SEPARATOR VARIABLE.
+					#########################################################################################
 					if s.k != 0 or s.o != 0:
+						#########################################################################################
+						# THE CONSTRAINTS ALLOW US TO SKIP THIS VARIABLE.
+						#########################################################################################
 						new_O = list(s.O)
 						new_s = MDP(domain, new_X, tuple(new_O), gamma, local_reward[new_X, tuple(new_O)], s.o, s.k, s.m, s.B)
 						WL.append(new_s)
 						s.skip_state = new_s
 					if (s.B > s.m) or (s.B >= s.m and s.o == 0):
+						#########################################################################################
+						# THE CONSTRAINTS ALLOW US TO OBSERVE THIS VARIABLE.
+						#########################################################################################
 						new_Xs = (1, 0)
 						for i in range(domain):
 							new_O = [(new_Xs, i)]
@@ -152,8 +225,14 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 						WL.append(new_s)
 						s.skip_state = new_s'''
 			else:
+				#########################################################################################
+				# SEPARATOR VARIABLE.
+				#########################################################################################
 				new_X = next(s.X)
 				if new_X[0] == 0:
+					#########################################################################################
+					# THE NEXT VARIABLE IS A NON-SEPARATOR VARIABLE, AND HENCE OBSERVED BY DEFAULT.
+					#########################################################################################
 					for i in range(domain):
 						new_O = list(s.O)
 						new_O.append((new_X, i))
@@ -168,7 +247,13 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 						s.select_prob[i] = prob[(new_X, i), s.O]
 						s.choice = 1
 				else:
+					#########################################################################################
+					# THE NEXT VARIABLE IS A SEPARATOR VARIABLE.
+					#########################################################################################
 					if s.k != 1 or s.o != 0:
+						#########################################################################################
+						# THE CONSTRAINTS ALLOW US TO SKIP THIS VARIABLE.
+						#########################################################################################
 						new_O = list(s.O)
 						if s.k == 0 and s.m == 0:
 							new_s = MDP(domain, new_X, tuple(new_O), gamma, local_reward[new_X, tuple(new_O)], 0, k - 1, m, min(s.B + B, max_B))
@@ -179,6 +264,9 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 						WL.append(new_s)
 						s.skip_state = new_s
 					if (s.B > s.m) or (s.B >= s.m and s.o == 0) or (s.B >= s.m and s.k == 0):
+						#########################################################################################
+						# THE CONSTRAINTS ALLOW US TO OBSERVE THIS VARIABLE.
+						#########################################################################################
 						new_Xs = (1, 0)
 						for i in range(domain):
 							new_O = [(new_Xs, i)]
@@ -235,6 +323,11 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 						WL.append(new_s)
 						s.skip_state = new_s'''
 			MDP_states[(s.X, s.O, s.o, s.k, s.m, s.B)] = s
+			reg_ID[(s.X, s.O, s.o, s.k, s.m, s.B)] = id
+			id += 1
+	#########################################################################################
+	# ENSURE ALL SUCCESSOR STATES ARE IN THE DICTIONARY.
+	#########################################################################################
 	for state in MDP_states:
 		if MDP_states[state].select_state[0] != None:
 			for i in range(domain):
@@ -243,10 +336,16 @@ def plan_MDP(domain, k, m, B, max_B, gamma):
 		if MDP_states[state].skip_state != None:
 			outsider = MDP_states[state].skip_state
 			MDP_states[state].skip_state = MDP_states[(outsider.X, outsider.O, outsider.o, outsider.k, outsider.m, outsider.B)]
-	return 	MDP_states
+	return 	MDP_states, reg_ID
 
+#########################################################################################
+# VALUE ITERATION.
+#########################################################################################	
 def find_plan(MDP_states, domain, epsilon, k):
 	if k == inf:
+		#########################################################################################
+		# WE ITERATE UNTIL THE BELLMAN RESIDUE BECOMES LESS THAN epsilon.
+		#########################################################################################
 		j = 0
 		diff = inf
 		while diff >= epsilon:
@@ -273,6 +372,9 @@ def find_plan(MDP_states, domain, epsilon, k):
 					diff = abs(MDP_states[state].new_reward - MDP_states[state].old_reward)
 			j += 1
 	else:
+		#########################################################################################
+		# WE ITERATE k TIMES.
+		#########################################################################################
 		j = k + 1
 		diff = -inf
 		for i in range(k + 1):
@@ -304,16 +406,90 @@ def find_plan(MDP_states, domain, epsilon, k):
 	print(j)
 	return MDP_states, diff
 	
+#########################################################################################
+# VALUE ITERATION USING CUDA CORES.
+#########################################################################################
+update = mod.get_function("update")
+
+def find_plan_CUDA(MDP_states, ID, domain, gamma, k):
+	#########################################################################################
+	# THE MDP_states DICTIONARY IS CAST IN FORM OF numpy ARRAYS USING DICTIONARY ID.
+	#########################################################################################
+	local = [0.0 for i in range(len(ID))]
+	select = [0 for i in range(len(ID) * domain)]
+	prob = [0.0 for i in range(len(ID) * domain)]
+	skip = [0 for i in range(len(ID))]
+	for state in MDP_states:
+		local[int(ID[state])] = MDP_states[state].local_reward
+		if MDP_states[state].select_state[0] == None:
+			for i in range(domain):
+				select[int(ID[state]) * domain + i] = -1
+				prob[int(ID[state]) * domain + i] = -1
+		else:
+			for i in range(domain):
+				s = MDP_states[state].select_state[i]
+				select[int(ID[state]) * domain + i] = ID[(s.X, s.O, s.o, s.k, s.m, s.B)]
+				prob[int(ID[state]) * domain + i] = MDP_states[state].select_prob[i]
+		if MDP_states[state].skip_state == None:
+			skip[int(ID[state])] = -1
+		else:
+			s = MDP_states[state].skip_state
+			skip[int(ID[state])] = ID[(s.X, s.O, s.o, s.k, s.m, s.B)]
+	#########################################################################################
+	# PAD TO AVOID pycuda.drv.LogicError.
+	#########################################################################################
+	auxl = numpy.asarray(local).astype(numpy.float32)
+	local = numpy.zeros((len(ID) + 1024 - (len(ID) % 1024),), dtype = numpy.float32)
+	local[:auxl.shape[0]] = auxl
+	select = numpy.asarray(select).astype(numpy.int)
+	prob = numpy.asarray(prob).astype(numpy.float32)
+	skip = numpy.asarray(skip).astype(numpy.int)
+	new = numpy.zeros_like(local)
+	old = numpy.zeros_like(local)
+	pars = [domain, gamma, len(ID)]
+	pars = numpy.asarray(pars).astype(numpy.float32)
+	#########################################################################################
+	# CREATE GPU COPIES OF numpy ARRAYS.
+	#########################################################################################
+	local_gpu = gpuarray.to_gpu(local)
+	select_gpu = gpuarray.to_gpu(select)
+	prob_gpu = gpuarray.to_gpu(prob)
+	skip_gpu = gpuarray.to_gpu(skip)
+	new_gpu = gpuarray.to_gpu(new)
+	old_gpu = gpuarray.to_gpu(old)
+	pars_gpu = gpuarray.to_gpu(pars)
+	#########################################################################################
+	# ITERATE A PREDETERMINED NUMBER OF TIMES, k. BLOCK AND GRID SIZES MAY NEED TO BE ALTERED
+	# DEPENDING ON COMPUTE CAPABILITY VERSION. VERSION USED: 2.1.
+	#########################################################################################
+	for i in range(k):
+		update(old_gpu, new_gpu, local_gpu, select_gpu, prob_gpu, skip_gpu, pars_gpu, block = (1024, 1, 1), grid = (int(local.size / 1024), 1, 1))
+		old_gpu, new_gpu = new_gpu, old_gpu
+	return old_gpu[0]
+	
+#########################################################################################
+# MDP CORRESPONDING TO THE UNIFORM SPACING HEURISTIC.
+#########################################################################################
 def uniform_MDP(domain, frac, gamma):
+	#########################################################################################
+	# frac DEFINES THE SPACING.
+	#########################################################################################
+	#########################################################################################
+	# WE EMPLOY THE DICTIONARY uni_ID TO KEEP TRACK OF AN ORDERING OF MDP STATES.
+	#########################################################################################
 	uniform_states = dict()
-	pen = 0.54
-	s = MDP  (domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, 1, 0, 0, 0)
+	uni_ID = dict()
+	pen = 0.0
+	s, id = MDP(domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, (frac[1], frac[1]), 0, 0, 0), 0
 	WL =[s]
 	while len(WL) != 0:
 		s = WL.pop(0)
-		if (s.X, s.O, round(s.o, 5)) not in uniform_states:
+		if (s.X, s.O, s.o, 0, 0, 0) not in uniform_states:
 			new_X = next(s.X)
 			if new_X[0] == 0:
+				#########################################################################################
+				# THE NEXT VARIABLE IS A NON_SEPARATOR VARIABLE, AND HENCE OBSERVED BY DEFAULT.
+				#########################################################################################
 				for i in range(domain):
 					new_O = list(s.O)
 					if new_O == [((-1, -1), -1)]:
@@ -325,34 +501,43 @@ def uniform_MDP(domain, frac, gamma):
 					s.select_state[i] = new_s
 					s.select_prob[i] = prob[(new_X, i), s.O]
 			else:
-				new_o = s.o - 1
-				if round(new_o, 5) < 1:
+				#########################################################################################
+				# THE NEXT VARIABLE IS A SEPARATOR VARIABLE.
+				#########################################################################################
+				if s.o[0] - frac[1] < frac[1]:
 					new_Xs = (1, 0)
 					for i in range(domain):
 						new_O = [(new_Xs, i)]
-						new_s = MDP(domain, new_Xs, tuple(new_O), gamma, 0.0 - pen, new_o + frac, 0, 0, 0)
+						new_s = MDP(domain, new_Xs, tuple(new_O), gamma, 0.0 - pen, (s.o[0] - frac[1] + frac[0], frac[1]), 0, 0, 0)
 						WL.append(new_s)
 						s.select_state[i] = new_s
 						s.select_prob[i] = prob[(new_X, i), s.O]
 				else:
 					new_O = list(s.O)
-					new_s = MDP(domain, new_X, tuple(new_O), gamma, local_reward[new_X, tuple(new_O)], new_o, 0, 0, 0)
+					new_s = MDP(domain, new_X, tuple(new_O), gamma, local_reward[new_X, tuple(new_O)], (s.o[0] - frac[1], frac[1]), 0, 0, 0)
 					WL.append(new_s)
 					s.skip_state = new_s
-			uniform_states[(s.X, s.O, round(s.o, 5))] = s
+			uniform_states[(s.X, s.O, s.o, 0, 0, 0)] = s
+			uni_ID[(s.X, s.O, s.o, 0, 0, 0)] = id
+			id += 1
+	#########################################################################################
+	# ENSURE ALL SUCCESSOR STATES ARE IN THE DICTIONARY.
+	#########################################################################################
 	for state in uniform_states:
 		if uniform_states[state].select_state[0] != None:
 			for i in range(domain):
 				outsider = uniform_states[state].select_state[i]
-				uniform_states[state].select_state[i] = uniform_states[(outsider.X, outsider.O, round(outsider.o, 5))]
+				uniform_states[state].select_state[i] = uniform_states[(outsider.X, outsider.O, outsider.o, 0, 0, 0)]
 		if uniform_states[state].skip_state != None:
 			outsider = uniform_states[state].skip_state
-			uniform_states[state].skip_state = uniform_states[(outsider.X, outsider.O, round(outsider.o, 5))]
-	return 	uniform_states				
-			
-	
+			uniform_states[state].skip_state = uniform_states[(outsider.X, outsider.O, outsider.o, 0, 0, 0)]
+	return 	uniform_states, uni_ID				
+
+#########################################################################################
+# MORE EFFICIENT IMPLEMENTATION OF VoIDP (GHOSH AND RAMAKRISHNAN, 2017).
+#########################################################################################	
 def e_plan_MDP(select, Xi, Vi, Ob, n, B, domain, gamma, first):
-	pen = 0.54
+	pen = 0.0
 	s = finite_MDP(domain)
 	if select == True or Xi == -1:
 		new_Ob = (Xi, Vi)
@@ -397,7 +582,7 @@ def e_plan_MDP(select, Xi, Vi, Ob, n, B, domain, gamma, first):
 	mdp_states[(Xi, new_Ob, new_B, new_first)] = (s, s.reward, newer_first, s.choice, Xi, new_Ob)
 	return s, s.reward, newer_first
 	
-def compute_reward(domain, s, n, first, first_r):
+'''def compute_reward(domain, s, n, first, first_r):
 	if s in aux_mdp_states:
 		return aux_mdp_states[s]
 	else:
@@ -417,20 +602,11 @@ def compute_reward(domain, s, n, first, first_r):
 				temp += prob[(((1, n - s.Ob[0] + first + 1), i), (((1, 0), s.Ob[1]),))] * first_r[i]
 			cur_reward = pow(gamma, j) * temp
 		aux_mdp_states[s] = cur_reward
-		return cur_reward
-	
-def finite_local_reward(Xi, Ob):
-	if Ob[0] == -1:
-		return local_reward[(1, Xi), (((-1, -1), -1),)]
-	else:
-		return local_reward[(1, Xi - Ob[0]), (((1, 0), Ob[1]),)]
-
-def finite_prob(Xi, Ob):
-	if Ob[0] == -1:
-		return prob[(((1, Xi[0]), Xi[1]), (((-1, -1), -1),))]
-	else:
-		return prob[(((1, Xi[0] - Ob[0]), Xi[1]), (((1, 0), Ob[1]),))]
-
+		return cur_reward'''
+		
+#########################################################################################
+# FUNCTIONS FOR PERFORMING PROBABILISTIC INFERENCES IN CHAIN MODELS.
+#########################################################################################
 def prob_infers(domain, k):
 	for i in range(domain):
 		prob[(((1, 0), i), (((-1, -1), -1),))] = prior[i]
@@ -450,7 +626,19 @@ def prob_infers(domain, k):
 				for v3 in range(domain):
 					temp += prob[(((1, i - 1), v3), (((1, 0), v2),))] * transition[v3][v1]
 				prob[(((1, i), v1), (((1, 0), v2),))] = temp
-
+				
+def finite_prob(Xi, Ob):
+	if Ob[0] == -1:
+		return prob[(((1, Xi[0]), Xi[1]), (((-1, -1), -1),))]
+	else:
+		return prob[(((1, Xi[0] - Ob[0]), Xi[1]), (((1, 0), Ob[1]),))]
+		
+#########################################################################################
+# FUNCTIONS FOR COMPUTING LOCAL REWARDS IN CHAIN MODELS.
+#########################################################################################
+#########################################################################################
+# RESIDUAL ENTROPY.
+#########################################################################################
 def loc_rewards(domain, k):
 	for i in range(k):
 		temp = 0.0
@@ -464,6 +652,15 @@ def loc_rewards(domain, k):
 				temp += (prob[(((1, i), l), (((1, 0), j),))] * log(prob[(((1, i), l), (((1, 0), j),))]))
 			local_reward[((1, i), (((1, 0), j),))] = temp
 			
+def finite_local_reward(Xi, Ob):
+	if Ob[0] == -1:
+		return local_reward[(1, Xi), (((-1, -1), -1),)]
+	else:
+		return local_reward[(1, Xi - Ob[0]), (((1, 0), Ob[1]),)]
+		
+#########################################################################################
+# MARGIN OF CONFIDENCE.
+#########################################################################################		
 def loc_rewards_mc(domain, k):
 	for i in range(k):
 		max1, max2 = -inf, -inf
@@ -485,7 +682,13 @@ def loc_rewards_mc(domain, k):
 					max2 = prob[(((1, i), l), (((1, 0), j),))]
 			local_reward[((1, i), (((1, 0), j),))] = max1 - max2
 			
+#########################################################################################
+# FUNCTION FOR PERFORMING PROBABILISTIC INFERENCES AND COMPUTING LOCAL REWARDS IN HMMS.
+#########################################################################################		
 def prob_infers_nc(domain, k):
+	#########################################################################################
+	# THE SEPARATOR VARIABLE HAS NOT BEEN OBSERVED.
+	#########################################################################################
 	l = []
 	for i in range(domain):
 		for j in range(2 * k):
@@ -528,6 +731,9 @@ def prob_infers_nc(domain, k):
 				temp += prob[(((1, i), a), tuple(ls[0:i + 1]))] * log(prob[(((1, i), a), tuple(ls[0:i + 1]))])
 			local_reward[((1, i), tuple(ls[0:i + 1]))] = temp
 		del vs
+	#########################################################################################
+	# THE SEPARATOR VARIABLE HAS BEEN OBSERVED.
+	#########################################################################################
 	for i in range(domain):
 		for j in range(domain):
 			prob[(((1, 1), i), (((1, 0), j),))] = transition[j][i]
@@ -569,10 +775,21 @@ def prob_infers_nc(domain, k):
 				temp += prob[(((1, i), a), tuple(ls[0:i + 1]))] * log(prob[(((1, i), a), tuple(ls[0:i + 1]))])
 			local_reward[((1, i), tuple(ls[0:i + 1]))] = temp
 		del vs
-			
+
+#########################################################################################
+# MDP CORRESPONDING TO INFINITELY REPEATING THE FINITE-HORIZON PLAN DETERMINED BY VoIDP.
+# THIS IS ONLY FOR CHAIN MODELS SINCE VoIDP IS ONLY APPLICABLE TO CHAINS.
+#########################################################################################	
 def greedy_MDP(domain, k, f, i):
+	#########################################################################################
+	# f is DETERMINED BY e_plan_MDP.
+	#########################################################################################
 	new_mdp_states = dict()
-	pen = 0.54
+	pen = 0.0
+	#########################################################################################
+	# WE KEEP TRACK OF THE ACTION TO BE TAKEN UNDER EACH SCENARIO IN DICTIONARY
+	# new_mdp_states.
+	#########################################################################################
 	for state in mdp_states:
 		if state[1] == (-1, -1):
 			if state[0] == -1:
@@ -581,12 +798,16 @@ def greedy_MDP(domain, k, f, i):
 				new_mdp_states[((1, state[0]), (((-1, -1), -1),), state[0], state[2])] = mdp_states[state][0].choice
 		else:
 			new_mdp_states[((1, state[0] - state[1][0]), (((1, 0), state[1][1]),), state[0], state[2])] = mdp_states[state][0].choice
+	#########################################################################################
+	# WE EMPLOY THE DICTIONARY reg_ID TO KEEP TRACK OF AN ORDERING OF MDP STATES.
+	#########################################################################################
 	greedy_states = dict()
-	s = MDP(domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, -1, 0, 0, i)
+	greedy_ID = dict()
+	s, id = MDP(domain, (-1, -1), (((-1, -1), -1),), gamma, 0.0, -1, 0, 0, i), 0
 	WL =[s]
 	while len(WL) != 0:
 		s = WL.pop(0)
-		if (s.X, s.O, s.o, s.B) not in greedy_states:
+		if (s.X, s.O, s.o, 0, 0, s.B) not in greedy_states:
 			new_X = next(s.X)
 			if s.o == f - 1 or s.o - k == f - 1:
 				new_Xs = (1, 0)
@@ -639,54 +860,77 @@ def greedy_MDP(domain, k, f, i):
 					new_s = MDP(domain, new_X, tuple(new_O), gamma, local_reward[new_X, tuple(new_O)], new_o, 0, 0, new_B)
 					WL.append(new_s)
 					s.skip_state = new_s
-			greedy_states[(s.X, s.O, s.o, s.B)] = s
+			greedy_states[(s.X, s.O, s.o, 0, 0, s.B)] = s
+			greedy_ID[(s.X, s.O, s.o, 0, 0, s.B)] = id
+			id += 1
+	#########################################################################################
+	# ENSURE ALL SUCCESSOR STATES ARE IN THE DICTIONARY.
+	#########################################################################################
 	for state in greedy_states:
 		if greedy_states[state].select_state[0] != None:
 			for j in range(domain):
 				outsider = greedy_states[state].select_state[j]
-				greedy_states[state].select_state[j] = greedy_states[(outsider.X, outsider.O, outsider.o, outsider.B)]
+				greedy_states[state].select_state[j] = greedy_states[(outsider.X, outsider.O, outsider.o, 0, 0, outsider.B)]
 		if greedy_states[state].skip_state != None:
 			outsider = greedy_states[state].skip_state
-			greedy_states[state].skip_state = greedy_states[(outsider.X, outsider.O, outsider.o, outsider.B)]
-	return	greedy_states
+			greedy_states[state].skip_state = greedy_states[(outsider.X, outsider.O, outsider.o, 0, 0, outsider.B)]
+	return	greedy_states, greedy_ID
 
 if __name__ == '__main__':
 	#########################################################################################
 	# DO NOT UNCOMMENT BOTH OF THE FOLLOWING SECTIONS SIMULTAENEOUSLY.
 	#########################################################################################
 	#########################################################################################
+	# domain: SIZE OF DOMAIN OF VARIABLES IN THE MODEL.
+	# k: THE SEPARATOR VARIABLE MUST BE OBSERVED AT LEAST ONCE IN k TIME STEPS.
+	# m: NUMBER OF k-LENGTH INTERVALS AT WHICH BUDGET GETS REPLENISHED.
+	# gamma: DISCOUNT FACTOR.
+	# d: CONTROLS THE NUMBER OF ITERATIONS
+	#########################################################################################
+	#########################################################################################
 	# UNCOMMENT THE NEXT SECTION TO RUN THE ALGORITHM FOR THE TEMPERATURE TASK (CHAIN MODEL).
 	#########################################################################################
-	'''domain, k, m, gamma, d = 5, 12, 1, 0.99, inf
+	domain, k, m, gamma, d = 5, 12, 1, 0.999, inf
 	prob_infers(domain, k)
 	loc_rewards(domain, k)
 	for i in range(1, k + 1):
+		#########################################################################################
+		# i: INITIAL BUDGET. GETS REPLENISHED TO i EVERY k * m TIME STEPS.
+		#########################################################################################
 		s, r, f = e_plan_MDP(False, -1, -1, (-1, -1), k - 1, i, domain, gamma, -1)
-		greedy_states = greedy_MDP(domain, k, f, i)
-		greedy_states, diff1 = find_plan(greedy_states, domain, 0.000001, inf)
-		inf_g = greedy_states[((-1, -1), (((-1, -1), -1),), -1, i)].old_reward
+		greedy_states, greedy_ID = greedy_MDP(domain, k, f, i)
+		#greedy_states, diff1 = find_plan(greedy_states, domain, 0.000001, d)
+		#inf_g = greedy_states[((-1, -1), (((-1, -1), -1),), -1, i)].old_reward
+		inf_g = find_plan_CUDA(greedy_states, greedy_ID, domain, gamma, 30000)
 		del greedy_states
-		MDP_states = plan_MDP(domain, k, m, i, i, gamma)
-		MDP_states, diff2 = find_plan(MDP_states, domain, 0.000001, inf)
-		inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
+		MDP_states, reg_ID = plan_MDP(domain, k, m, i, i, gamma)
+		#MDP_states, diff2 = find_plan(MDP_states, domain, 0.000001, d)
+		#inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
+		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma, 30000)
 		del MDP_states
-		uniform_states = uniform_MDP(domain, k / i, gamma)
-		uniform_states, diff3 = find_plan(uniform_states, domain, 0.000001, inf)
-		inf_ru = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
+		uniform_states, uni_ID = uniform_MDP(domain, (k , i), gamma)
+		#uniform_states, diff3 = find_plan(uniform_states, domain, 0.000001, d)
+		#inf_u = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
+		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma, 30000)
 		del uniform_states
-		print('[', inf_g, ',', inf_ru, ',', inf_r - (100 * diff2), '],')'''
+		print('[', inf_g, ',', inf_u, ',', inf_r, '],')
 	#########################################################################################
 	# UNCOMMENT THE NEXT SECTION TO RUN THE ALGORITHM FOR THE PSYCHIATRY TASK (HMM).
 	#########################################################################################
-	'''domain, k, m, gamma, d = 5, 2, 12, pow(0.95, 0.5), 12.5
+	'''domain, k, m, gamma, d = 5, 2, 12, pow(0.99, 0.5), 12.5
 	prob_infers_nc(domain, k)
-	for i in range(12, (k * m) - 1):
-		MDP_states = plan_MDP(domain, k, m, i, i, gamma)
-		MDP_states, diff1 = find_plan(MDP_states, domain, 0.0001, int(k * m * d) - 1)
-		inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
+	for i in range(23, (k * m)):
+		#########################################################################################
+		# i: INITIAL BUDGET. GETS REPLENISHED TO i EVERY k * m TIME STEPS.
+		#########################################################################################
+		MDP_states, reg_ID = plan_MDP(domain, k, m, i, i, gamma)
+		#MDP_states, diff1 = find_plan(MDP_states, domain, 0.0001, int(k * m * d) - 1)
+		#inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
+		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma, 10000)
 		del MDP_states
-		uniform_states = uniform_MDP(domain, (k * m) / i, gamma)
-		uniform_states, diff2 = find_plan(uniform_states, domain, 0.0001, int(k * m * d) - 1)
-		inf_ru = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
+		uniform_states, uni_ID = uniform_MDP(domain, ((k * m), i), gamma)
+		#uniform_states, diff2 = find_plan(uniform_states, domain, 0.0001, int(k * m * d) - 1)
+		#inf_ru = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
+		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma, 10000)
 		del uniform_states
-		print('[', inf_r - (diff1 * 39.5), ',', inf_ru, '],')'''
+		print('[', inf_r, ',', inf_u, '],')'''
