@@ -4,4 +4,4 @@ Python Implementation of VoI optimization techniques in temporal graphical model
 Both 'finite_horizon.py' and 'infinite_horizon.py' are standalone.
 More details have been included as comments.
 
-The code for the infinite horizon case ('infinite_horizon.py') does not include the CUDA enhancement. Will be updated shortly.
+The code for the infinite horizon case ('infinite_horizon.py') includes the CUDA enhanced value iteration.
