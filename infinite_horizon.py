@@ -411,7 +411,7 @@ def find_plan(MDP_states, domain, epsilon, k):
 #########################################################################################
 update = mod.get_function("update")
 
-def find_plan_CUDA(MDP_states, ID, domain, gamma, k):
+def find_plan_CUDA(MDP_states, ID, domain, gamma):
 	#########################################################################################
 	# THE MDP_states DICTIONARY IS CAST IN FORM OF numpy ARRAYS USING DICTIONARY ID.
 	#########################################################################################
@@ -462,9 +462,19 @@ def find_plan_CUDA(MDP_states, ID, domain, gamma, k):
 	# ITERATE A PREDETERMINED NUMBER OF TIMES, k. BLOCK AND GRID SIZES MAY NEED TO BE ALTERED
 	# DEPENDING ON COMPUTE CAPABILITY VERSION. VERSION USED: 2.1.
 	#########################################################################################
-	for i in range(k):
+	i = 0
+	while True:
 		update(old_gpu, new_gpu, local_gpu, select_gpu, prob_gpu, skip_gpu, pars_gpu, block = (1024, 1, 1), grid = (int(local.size / 1024), 1, 1))
 		old_gpu, new_gpu = new_gpu, old_gpu
+		if (i + 1) % 5000 == 0:
+			old = old_gpu.get()
+			new = new_gpu.get()
+			for j in range(len(ID)):
+				if old[j] != new[j]:
+					break
+			if j == len(ID) - 1:
+				break
+		i += 1
 	return old_gpu[0]
 	
 #########################################################################################
@@ -901,17 +911,17 @@ if __name__ == '__main__':
 		greedy_states, greedy_ID = greedy_MDP(domain, k, f, i)
 		#greedy_states, diff1 = find_plan(greedy_states, domain, 0.000001, d)
 		#inf_g = greedy_states[((-1, -1), (((-1, -1), -1),), -1, i)].old_reward
-		inf_g = find_plan_CUDA(greedy_states, greedy_ID, domain, gamma, 30000)
+		inf_g = find_plan_CUDA(greedy_states, greedy_ID, domain, gamma)
 		del greedy_states
 		MDP_states, reg_ID = plan_MDP(domain, k, m, i, i, gamma)
 		#MDP_states, diff2 = find_plan(MDP_states, domain, 0.000001, d)
 		#inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
-		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma, 30000)
+		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma)
 		del MDP_states
 		uniform_states, uni_ID = uniform_MDP(domain, (k , i), gamma)
 		#uniform_states, diff3 = find_plan(uniform_states, domain, 0.000001, d)
 		#inf_u = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
-		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma, 30000)
+		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma)
 		del uniform_states
 		print('[', inf_g, ',', inf_u, ',', inf_r, '],')
 	#########################################################################################
@@ -926,11 +936,11 @@ if __name__ == '__main__':
 		MDP_states, reg_ID = plan_MDP(domain, k, m, i, i, gamma)
 		#MDP_states, diff1 = find_plan(MDP_states, domain, 0.0001, int(k * m * d) - 1)
 		#inf_r = MDP_states[((-1, -1), (((-1, -1), -1),), 0, k - 1, m, i)].old_reward
-		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma, 10000)
+		inf_r = find_plan_CUDA(MDP_states, reg_ID, domain, gamma)
 		del MDP_states
 		uniform_states, uni_ID = uniform_MDP(domain, ((k * m), i), gamma)
 		#uniform_states, diff2 = find_plan(uniform_states, domain, 0.0001, int(k * m * d) - 1)
 		#inf_ru = uniform_states[((-1, -1), (((-1, -1), -1),), 1)].old_reward
-		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma, 10000)
+		inf_u = find_plan_CUDA(uniform_states, uni_ID, domain, gamma)
 		del uniform_states
 		print('[', inf_r, ',', inf_u, '],')'''
